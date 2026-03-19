@@ -293,6 +293,58 @@ describe('AppFrameComponent', () => {
     expect(component.isMenuCollapsed).toBeTruthy()
   })
 
+  it('should hide mobile search when scrolling down and show it when scrolling up', () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 767,
+    })
+
+    component.ngOnInit()
+
+    Object.defineProperty(window, 'scrollY', {
+      configurable: true,
+      value: 40,
+    })
+    component.onWindowScroll()
+    expect(component.mobileSearchHidden).toBe(true)
+
+    Object.defineProperty(window, 'scrollY', {
+      configurable: true,
+      value: 0,
+    })
+    component.onWindowScroll()
+    expect(component.mobileSearchHidden).toBe(false)
+  })
+
+  it('should keep mobile search visible on desktop scroll', () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 768,
+    })
+    component.mobileSearchHidden = true
+
+    component.onWindowScroll()
+
+    expect(component.mobileSearchHidden).toBe(false)
+  })
+
+  it('should keep mobile search visible while the mobile menu is expanded', () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 767,
+    })
+    component.ngOnInit()
+    component.isMenuCollapsed = false
+
+    Object.defineProperty(window, 'scrollY', {
+      configurable: true,
+      value: 40,
+    })
+    component.onWindowScroll()
+
+    expect(component.mobileSearchHidden).toBe(false)
+  })
+
   it('should support close document & navigate on close current doc', () => {
     const closeSpy = jest.spyOn(openDocumentsService, 'closeDocument')
     closeSpy.mockReturnValue(of(true))

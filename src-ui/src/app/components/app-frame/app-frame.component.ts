@@ -94,6 +94,14 @@ export class AppFrameComponent
 
   slimSidebarAnimating: boolean = false
 
+  mobileSearchHidden: boolean = false
+
+  private lastScrollY: number = 0
+
+  private readonly mobileBreakpoint = 768
+
+  private readonly mobileSearchHideThreshold = 16
+
   constructor() {
     super()
     const permissionsService = this.permissionsService
@@ -111,6 +119,8 @@ export class AppFrameComponent
   }
 
   ngOnInit(): void {
+    this.lastScrollY = window.scrollY
+
     if (this.settingsService.get(SETTINGS_KEYS.UPDATE_CHECKING_ENABLED)) {
       this.checkForUpdates()
     }
@@ -263,6 +273,37 @@ export class AppFrameComponent
     return this.settingsService.get(SETTINGS_KEYS.AI_ENABLED)
   }
 
+  @HostListener('window:resize')
+  onWindowResize(): void {
+    if (!this.isMobileViewport()) {
+      this.mobileSearchHidden = false
+    }
+  }
+
+  @HostListener('window:scroll')
+  onWindowScroll(): void {
+    const currentScrollY = window.scrollY
+
+    if (!this.isMobileViewport() || this.isMenuCollapsed === false) {
+      this.mobileSearchHidden = false
+      this.lastScrollY = currentScrollY
+      return
+    }
+
+    const delta = currentScrollY - this.lastScrollY
+
+    if (currentScrollY <= 0 || delta < -this.mobileSearchHideThreshold) {
+      this.mobileSearchHidden = false
+    } else if (
+      currentScrollY > this.mobileSearchHideThreshold &&
+      delta > this.mobileSearchHideThreshold
+    ) {
+      this.mobileSearchHidden = true
+    }
+
+    this.lastScrollY = currentScrollY
+  }
+
   closeMenu() {
     this.isMenuCollapsed = true
   }
@@ -383,5 +424,9 @@ export class AppFrameComponent
       this.settingsService.get(SETTINGS_KEYS.SIDEBAR_VIEWS_SHOW_COUNT) &&
       !this.settingsService.organizingSidebarSavedViews
     )
+  }
+
+  private isMobileViewport(): boolean {
+    return window.innerWidth < this.mobileBreakpoint
   }
 }
