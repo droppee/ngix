@@ -20,6 +20,7 @@ from documents.models import Tag
 from documents.models import Workflow
 from documents.models import WorkflowTrigger
 from documents.permissions import get_objects_for_user_owner_aware
+from documents.regex import safe_regex_search
 
 if TYPE_CHECKING:
     from django.db.models import QuerySet
@@ -152,7 +153,7 @@ def match_storage_paths(document: Document, classifier: DocumentClassifier, user
 
 
 def matches(matching_model: MatchingModel, document: Document):
-    search_kwargs = {}
+    search_flags = 0
 
     document_content = document.content
 
@@ -161,14 +162,18 @@ def matches(matching_model: MatchingModel, document: Document):
         return False
 
     if matching_model.is_insensitive:
-        search_kwargs = {"flags": re.IGNORECASE}
+        search_flags = re.IGNORECASE
 
     if matching_model.matching_algorithm == MatchingModel.MATCH_NONE:
         return False
 
     elif matching_model.matching_algorithm == MatchingModel.MATCH_ALL:
         for word in _split_match(matching_model):
-            search_result = re.search(rf"\b{word}\b", document_content, **search_kwargs)
+            search_result = re.search(
+                rf"\b{word}\b",
+                document_content,
+                flags=search_flags,
+            )
             if not search_result:
                 return False
         log_reason(
@@ -180,7 +185,7 @@ def matches(matching_model: MatchingModel, document: Document):
 
     elif matching_model.matching_algorithm == MatchingModel.MATCH_ANY:
         for word in _split_match(matching_model):
-            if re.search(rf"\b{word}\b", document_content, **search_kwargs):
+            if re.search(rf"\b{word}\b", document_content, flags=search_flags):
                 log_reason(matching_model, document, f"it contains this word: {word}")
                 return True
         return False
@@ -190,7 +195,7 @@ def matches(matching_model: MatchingModel, document: Document):
             re.search(
                 rf"\b{re.escape(matching_model.match)}\b",
                 document_content,
-                **search_kwargs,
+                flags=search_flags,
             ),
         )
         if result:
@@ -202,16 +207,11 @@ def matches(matching_model: MatchingModel, document: Document):
         return result
 
     elif matching_model.matching_algorithm == MatchingModel.MATCH_REGEX:
-        try:
-            match = re.search(
-                re.compile(matching_model.match, **search_kwargs),
-                document_content,
-            )
-        except re.error:
-            logger.error(
-                f"Error while processing regular expression {matching_model.match}",
-            )
-            return False
+        match = safe_regex_search(
+            matching_model.match,
+            document_content,
+            flags=search_flags,
+        )
         if match:
             log_reason(
                 matching_model,
@@ -403,6 +403,18 @@ def existing_document_matches_workflow(
                 f"Document tags {list(document.tags.all())} include excluded tags {list(trigger_has_not_tags_qs)}",
             )
 
+    allowed_correspondent_ids = set(
+        trigger.filter_has_any_correspondents.values_list("id", flat=True),
+    )
+    if (
+        allowed_correspondent_ids
+        and document.correspondent_id not in allowed_correspondent_ids
+    ):
+        return (
+            False,
+            f"Document correspondent {document.correspondent} is not one of {list(trigger.filter_has_any_correspondents.all())}",
+        )
+
     # Document correspondent vs trigger has_correspondent
     if (
         trigger.filter_has_correspondent_id is not None
@@ -424,6 +436,17 @@ def existing_document_matches_workflow(
             f"Document correspondent {document.correspondent} is excluded by {list(trigger.filter_has_not_correspondents.all())}",
         )
 
+    allowed_document_type_ids = set(
+        trigger.filter_has_any_document_types.values_list("id", flat=True),
+    )
+    if allowed_document_type_ids and (
+        document.document_type_id not in allowed_document_type_ids
+    ):
+        return (
+            False,
+            f"Document doc type {document.document_type} is not one of {list(trigger.filter_has_any_document_types.all())}",
+        )
+
     # Document document_type vs trigger has_document_type
     if (
         trigger.filter_has_document_type_id is not None
@@ -443,6 +466,17 @@ def existing_document_matches_workflow(
         return (
             False,
             f"Document doc type {document.document_type} is excluded by {list(trigger.filter_has_not_document_types.all())}",
+        )
+
+    allowed_storage_path_ids = set(
+        trigger.filter_has_any_storage_paths.values_list("id", flat=True),
+    )
+    if allowed_storage_path_ids and (
+        document.storage_path_id not in allowed_storage_path_ids
+    ):
+        return (
+            False,
+            f"Document storage path {document.storage_path} is not one of {list(trigger.filter_has_any_storage_paths.all())}",
         )
 
     # Document storage_path vs trigger has_storage_path
@@ -532,6 +566,10 @@ def prefilter_documents_by_workflowtrigger(
 
     # Correspondent, DocumentType, etc. filtering
 
+    if trigger.filter_has_any_correspondents.exists():
+        documents = documents.filter(
+            correspondent__in=trigger.filter_has_any_correspondents.all(),
+        )
     if trigger.filter_has_correspondent is not None:
         documents = documents.filter(
             correspondent=trigger.filter_has_correspondent,
@@ -541,6 +579,10 @@ def prefilter_documents_by_workflowtrigger(
             correspondent__in=trigger.filter_has_not_correspondents.all(),
         )
 
+    if trigger.filter_has_any_document_types.exists():
+        documents = documents.filter(
+            document_type__in=trigger.filter_has_any_document_types.all(),
+        )
     if trigger.filter_has_document_type is not None:
         documents = documents.filter(
             document_type=trigger.filter_has_document_type,
@@ -550,6 +592,10 @@ def prefilter_documents_by_workflowtrigger(
             document_type__in=trigger.filter_has_not_document_types.all(),
         )
 
+    if trigger.filter_has_any_storage_paths.exists():
+        documents = documents.filter(
+            storage_path__in=trigger.filter_has_any_storage_paths.all(),
+        )
     if trigger.filter_has_storage_path is not None:
         documents = documents.filter(
             storage_path=trigger.filter_has_storage_path,
@@ -604,8 +650,11 @@ def document_matches_workflow(
             "filter_has_tags",
             "filter_has_all_tags",
             "filter_has_not_tags",
+            "filter_has_any_document_types",
             "filter_has_not_document_types",
+            "filter_has_any_correspondents",
             "filter_has_not_correspondents",
+            "filter_has_any_storage_paths",
             "filter_has_not_storage_paths",
         )
     )

@@ -131,6 +131,10 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         self.assertIn("content", results_full[0])
         self.assertIn("id", results_full[0])
 
+        # Content length is used internally for performance reasons.
+        # No need to expose this field.
+        self.assertNotIn("content_length", results_full[0])
+
         response = self.client.get("/api/documents/?fields=id", format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         results = response.data["results"]
@@ -941,6 +945,23 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
         results = response.data["results"]
         self.assertEqual(len(results), 0)
 
+    def test_documents_title_content_filter_strips_boundary_whitespace(self):
+        doc = Document.objects.create(
+            title="Testwort",
+            content="",
+            checksum="A",
+            mime_type="application/pdf",
+        )
+
+        response = self.client.get(
+            "/api/documents/",
+            {"title_content": " Testwort "},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], doc.id)
+
     def test_document_permissions_filters(self):
         """
         GIVEN:
@@ -1646,6 +1667,44 @@ class TestDocumentApi(DirectoriesMixin, DocumentConsumeDelayMixin, APITestCase):
                 self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         self.consume_file_mock.assert_not_called()
+
+    def test_patch_document_integer_custom_field_out_of_range(self):
+        """
+        GIVEN:
+            - An integer custom field
+            - A document
+        WHEN:
+            - Patching the document with an integer value exceeding PostgreSQL's range
+        THEN:
+            - HTTP 400 is returned (validation catches the overflow)
+            - No custom field instance is created
+        """
+        cf_int = CustomField.objects.create(
+            name="intfield",
+            data_type=CustomField.FieldDataType.INT,
+        )
+        doc = Document.objects.create(
+            title="Doc",
+            checksum="123",
+            mime_type="application/pdf",
+        )
+
+        response = self.client.patch(
+            f"/api/documents/{doc.pk}/",
+            {
+                "custom_fields": [
+                    {
+                        "field": cf_int.pk,
+                        "value": 2**31,  # overflow for PostgreSQL integer fields
+                    },
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("custom_fields", response.data)
+        self.assertEqual(CustomFieldInstance.objects.count(), 0)
 
     def test_upload_with_webui_source(self):
         """

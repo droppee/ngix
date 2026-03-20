@@ -23,6 +23,7 @@ from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import User
 from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
 from django.db import connections
 from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.recorder import MigrationRecorder
@@ -34,7 +35,6 @@ from django.db.models import Model
 from django.db.models import Q
 from django.db.models import Sum
 from django.db.models import When
-from django.db.models.functions import Length
 from django.db.models.functions import Lower
 from django.db.models.manager import Manager
 from django.http import FileResponse
@@ -44,6 +44,7 @@ from django.http import HttpResponseBadRequest
 from django.http import HttpResponseForbidden
 from django.http import HttpResponseRedirect
 from django.http import HttpResponseServerError
+from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.decorators import method_decorator
@@ -51,7 +52,7 @@ from django.utils.timezone import make_aware
 from django.utils.translation import get_language
 from django.views import View
 from django.views.decorators.cache import cache_control
-from django.views.decorators.cache import cache_page
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import condition
 from django.views.decorators.http import last_modified
 from django.views.generic import TemplateView
@@ -91,10 +92,12 @@ from documents import index
 from documents.bulk_download import ArchiveOnlyStrategy
 from documents.bulk_download import OriginalAndArchiveStrategy
 from documents.bulk_download import OriginalsOnlyStrategy
+from documents.caching import get_llm_suggestion_cache
 from documents.caching import get_metadata_cache
 from documents.caching import get_suggestion_cache
 from documents.caching import refresh_metadata_cache
 from documents.caching import refresh_suggestions_cache
+from documents.caching import set_llm_suggestions_cache
 from documents.caching import set_metadata_cache
 from documents.caching import set_suggestions_cache
 from documents.classifier import load_classifier
@@ -108,6 +111,7 @@ from documents.conditionals import thumbnail_last_modified
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
 from documents.data_models import DocumentSource
+from documents.file_handling import format_filename
 from documents.filters import CorrespondentFilterSet
 from documents.filters import CustomFieldFilterSet
 from documents.filters import DocumentFilterSet
@@ -119,6 +123,7 @@ from documents.filters import PaperlessTaskFilterSet
 from documents.filters import ShareLinkFilterSet
 from documents.filters import StoragePathFilterSet
 from documents.filters import TagFilterSet
+from documents.mail import EmailAttachment
 from documents.mail import send_email
 from documents.matching import match_correspondents
 from documents.matching import match_document_types
@@ -180,19 +185,26 @@ from documents.signals import document_updated
 from documents.tasks import consume_file
 from documents.tasks import empty_trash
 from documents.tasks import index_optimize
+from documents.tasks import llmindex_index
 from documents.tasks import sanity_check
 from documents.tasks import train_classifier
 from documents.tasks import update_document_parent_tags
-from documents.templating.filepath import validate_filepath_template_and_render
 from documents.utils import get_boolean
 from paperless import version
 from paperless.celery import app as celery_app
+from paperless.config import AIConfig
 from paperless.config import GeneralConfig
-from paperless.db import GnuPG
 from paperless.models import ApplicationConfiguration
 from paperless.serialisers import GroupSerializer
 from paperless.serialisers import UserSerializer
 from paperless.views import StandardPagination
+from paperless_ai.ai_classifier import get_ai_document_classification
+from paperless_ai.chat import stream_chat_with_documents
+from paperless_ai.matching import extract_unmatched_names
+from paperless_ai.matching import match_correspondents_by_name
+from paperless_ai.matching import match_document_types_by_name
+from paperless_ai.matching import match_storage_paths_by_name
+from paperless_ai.matching import match_tags_by_name
 from paperless_mail.models import MailAccount
 from paperless_mail.models import MailRule
 from paperless_mail.oauth import PaperlessMailOAuth2Manager
@@ -447,7 +459,46 @@ class TagViewSet(ModelViewSet, PermissionsAwareDocumentCountMixin):
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context["document_count_filter"] = self.get_document_count_filter()
+        if hasattr(self, "_children_map"):
+            context["children_map"] = self._children_map
         return context
+
+    def list(self, request, *args, **kwargs):
+        """
+        Build a children map once to avoid per-parent queries in the serializer.
+        """
+        queryset = self.filter_queryset(self.get_queryset())
+        ordering = OrderingFilter().get_ordering(request, queryset, self) or (
+            Lower("name"),
+        )
+        queryset = queryset.order_by(*ordering)
+
+        all_tags = list(queryset)
+        descendant_pks = {pk for tag in all_tags for pk in tag.get_descendants_pks()}
+
+        if descendant_pks:
+            filter_q = self.get_document_count_filter()
+            children_source = list(
+                Tag.objects.filter(pk__in=descendant_pks | {t.pk for t in all_tags})
+                .select_related("owner")
+                .annotate(document_count=Count("documents", filter=filter_q))
+                .order_by(*ordering),
+            )
+        else:
+            children_source = all_tags
+
+        children_map = {}
+        for tag in children_source:
+            children_map.setdefault(tag.tn_parent_id, []).append(tag)
+        self._children_map = children_map
+
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page, many=True)
+        response = self.get_paginated_response(serializer.data)
+        if descendant_pks:
+            # Include children in the "all" field, if needed
+            response.data["all"] = [tag.pk for tag in children_source]
+        return response
 
     def perform_update(self, serializer):
         old_parent = self.get_object().get_parent()
@@ -707,6 +758,7 @@ class DocumentViewSet(
         "title",
         "correspondent__name",
         "document_type__name",
+        "storage_path__name",
         "created",
         "modified",
         "added",
@@ -897,37 +949,103 @@ class DocumentViewSet(
         ):
             return HttpResponseForbidden("Insufficient permissions")
 
-        document_suggestions = get_suggestion_cache(doc.pk)
+        ai_config = AIConfig()
 
-        if document_suggestions is not None:
-            refresh_suggestions_cache(doc.pk)
-            return Response(document_suggestions.suggestions)
-
-        classifier = load_classifier()
-
-        dates = []
-        if settings.NUMBER_OF_SUGGESTED_DATES > 0:
-            gen = parse_date_generator(doc.filename, doc.content)
-            dates = sorted(
-                {i for i in itertools.islice(gen, settings.NUMBER_OF_SUGGESTED_DATES)},
+        if ai_config.ai_enabled:
+            cached_llm_suggestions = get_llm_suggestion_cache(
+                doc.pk,
+                backend=ai_config.llm_backend,
             )
 
-        resp_data = {
-            "correspondents": [
-                c.id for c in match_correspondents(doc, classifier, request.user)
-            ],
-            "tags": [t.id for t in match_tags(doc, classifier, request.user)],
-            "document_types": [
-                dt.id for dt in match_document_types(doc, classifier, request.user)
-            ],
-            "storage_paths": [
-                dt.id for dt in match_storage_paths(doc, classifier, request.user)
-            ],
-            "dates": [date.strftime("%Y-%m-%d") for date in dates if date is not None],
-        }
+            if cached_llm_suggestions:
+                refresh_suggestions_cache(doc.pk)
+                return Response(cached_llm_suggestions.suggestions)
 
-        # Cache the suggestions and the classifier hash for later
-        set_suggestions_cache(doc.pk, resp_data, classifier)
+            llm_suggestions = get_ai_document_classification(doc, request.user)
+
+            matched_tags = match_tags_by_name(
+                llm_suggestions.get("tags", []),
+                request.user,
+            )
+            matched_correspondents = match_correspondents_by_name(
+                llm_suggestions.get("correspondents", []),
+                request.user,
+            )
+            matched_types = match_document_types_by_name(
+                llm_suggestions.get("document_types", []),
+                request.user,
+            )
+            matched_paths = match_storage_paths_by_name(
+                llm_suggestions.get("storage_paths", []),
+                request.user,
+            )
+
+            resp_data = {
+                "title": llm_suggestions.get("title"),
+                "tags": [t.id for t in matched_tags],
+                "suggested_tags": extract_unmatched_names(
+                    llm_suggestions.get("tags", []),
+                    matched_tags,
+                ),
+                "correspondents": [c.id for c in matched_correspondents],
+                "suggested_correspondents": extract_unmatched_names(
+                    llm_suggestions.get("correspondents", []),
+                    matched_correspondents,
+                ),
+                "document_types": [d.id for d in matched_types],
+                "suggested_document_types": extract_unmatched_names(
+                    llm_suggestions.get("document_types", []),
+                    matched_types,
+                ),
+                "storage_paths": [s.id for s in matched_paths],
+                "suggested_storage_paths": extract_unmatched_names(
+                    llm_suggestions.get("storage_paths", []),
+                    matched_paths,
+                ),
+                "dates": llm_suggestions.get("dates", []),
+            }
+
+            set_llm_suggestions_cache(doc.pk, resp_data, backend=ai_config.llm_backend)
+        else:
+            document_suggestions = get_suggestion_cache(doc.pk)
+
+            if document_suggestions is not None:
+                refresh_suggestions_cache(doc.pk)
+                return Response(document_suggestions.suggestions)
+
+            classifier = load_classifier()
+
+            dates = []
+            if settings.NUMBER_OF_SUGGESTED_DATES > 0:
+                gen = parse_date_generator(doc.filename, doc.content)
+                dates = sorted(
+                    {
+                        i
+                        for i in itertools.islice(
+                            gen,
+                            settings.NUMBER_OF_SUGGESTED_DATES,
+                        )
+                    },
+                )
+
+            resp_data = {
+                "correspondents": [
+                    c.id for c in match_correspondents(doc, classifier, request.user)
+                ],
+                "tags": [t.id for t in match_tags(doc, classifier, request.user)],
+                "document_types": [
+                    dt.id for dt in match_document_types(doc, classifier, request.user)
+                ],
+                "storage_paths": [
+                    dt.id for dt in match_storage_paths(doc, classifier, request.user)
+                ],
+                "dates": [
+                    date.strftime("%Y-%m-%d") for date in dates if date is not None
+                ],
+            }
+
+            # Cache the suggestions and the classifier hash for later
+            set_suggestions_cache(doc.pk, resp_data, classifier)
 
         return Response(resp_data)
 
@@ -955,10 +1073,8 @@ class DocumentViewSet(
                 doc,
             ):
                 return HttpResponseForbidden("Insufficient permissions")
-            if doc.storage_type == Document.STORAGE_TYPE_GPG:
-                handle = GnuPG.decrypted(doc.thumbnail_file)
-            else:
-                handle = doc.thumbnail_file
+
+            handle = doc.thumbnail_file
 
             return HttpResponse(handle, content_type="image/webp")
         except (FileNotFoundError, Document.DoesNotExist):
@@ -1216,12 +1332,28 @@ class DocumentViewSet(
                 return HttpResponseForbidden("Insufficient permissions")
 
         try:
+            attachments: list[EmailAttachment] = []
+            for doc in documents:
+                attachment_path = (
+                    doc.archive_path
+                    if use_archive_version and doc.has_archive_version
+                    else doc.source_path
+                )
+                attachments.append(
+                    EmailAttachment(
+                        path=attachment_path,
+                        mime_type=doc.mime_type,
+                        friendly_name=doc.get_public_filename(
+                            archive=use_archive_version and doc.has_archive_version,
+                        ),
+                    ),
+                )
+
             send_email(
                 subject=subject,
                 body=message,
                 to=addresses,
-                attachments=documents,
-                use_archive=use_archive_version,
+                attachments=attachments,
             )
 
             logger.debug(
@@ -1233,6 +1365,59 @@ class DocumentViewSet(
             return HttpResponseServerError(
                 "Error emailing documents, check logs for more detail.",
             )
+
+
+class ChatStreamingSerializer(serializers.Serializer):
+    q = serializers.CharField(required=True)
+    document_id = serializers.IntegerField(required=False, allow_null=True)
+
+
+@method_decorator(
+    [
+        ensure_csrf_cookie,
+        cache_control(no_cache=True),
+    ],
+    name="dispatch",
+)
+class ChatStreamingView(GenericAPIView):
+    permission_classes = (IsAuthenticated,)
+    serializer_class = ChatStreamingSerializer
+
+    def post(self, request, *args, **kwargs):
+        request.compress_exempt = True
+        ai_config = AIConfig()
+        if not ai_config.ai_enabled:
+            return HttpResponseBadRequest("AI is required for this feature")
+
+        try:
+            question = request.data["q"]
+        except KeyError:
+            return HttpResponseBadRequest("Invalid request")
+
+        doc_id = request.data.get("document_id")
+
+        if doc_id:
+            try:
+                document = Document.objects.get(id=doc_id)
+            except Document.DoesNotExist:
+                return HttpResponseBadRequest("Document not found")
+
+            if not has_perms_owner_aware(request.user, "view_document", document):
+                return HttpResponseForbidden("Insufficient permissions")
+
+            documents = [document]
+        else:
+            documents = get_objects_for_user_owner_aware(
+                request.user,
+                "view_document",
+                Document,
+            )
+
+        response = StreamingHttpResponse(
+            stream_chat_with_documents(query_str=question, documents=documents),
+            content_type="text/event-stream",
+        )
+        return response
 
 
 @extend_schema_view(
@@ -1486,6 +1671,7 @@ class BulkEditView(PassUserMixin):
         "merge": None,
         "edit_pdf": "checksum",
         "reprocess": "checksum",
+        "remove_password": "checksum",
     }
 
     permission_classes = (IsAuthenticated,)
@@ -1504,6 +1690,7 @@ class BulkEditView(PassUserMixin):
             bulk_edit.split,
             bulk_edit.merge,
             bulk_edit.edit_pdf,
+            bulk_edit.remove_password,
         ]:
             parameters["user"] = user
 
@@ -1532,6 +1719,7 @@ class BulkEditView(PassUserMixin):
                         bulk_edit.rotate,
                         bulk_edit.delete_pages,
                         bulk_edit.edit_pdf,
+                        bulk_edit.remove_password,
                     ]
                 )
                 or (
@@ -1548,7 +1736,7 @@ class BulkEditView(PassUserMixin):
                 and (
                     method in [bulk_edit.split, bulk_edit.merge]
                     or (
-                        method == bulk_edit.edit_pdf
+                        method in [bulk_edit.edit_pdf, bulk_edit.remove_password]
                         and not parameters["update_document"]
                     )
                 )
@@ -1863,7 +2051,7 @@ class SearchAutoCompleteView(GenericAPIView):
         user = self.request.user if hasattr(self.request, "user") else None
 
         if "term" in request.query_params:
-            term = request.query_params["term"]
+            term = request.query_params["term"].strip()
         else:
             return HttpResponseBadRequest("Term required")
 
@@ -2137,23 +2325,19 @@ class StatisticsView(GenericAPIView):
         user = request.user if request.user is not None else None
 
         documents = (
-            (
-                Document.objects.all()
-                if user is None
-                else get_objects_for_user_owner_aware(
-                    user,
-                    "documents.view_document",
-                    Document,
-                )
+            Document.objects.all()
+            if user is None
+            else get_objects_for_user_owner_aware(
+                user,
+                "documents.view_document",
+                Document,
             )
-            .only("mime_type", "content")
-            .prefetch_related("tags")
         )
         tags = (
             Tag.objects.all()
             if user is None
             else get_objects_for_user_owner_aware(user, "documents.view_tag", Tag)
-        )
+        ).only("id", "is_inbox_tag")
         correspondent_count = (
             Correspondent.objects.count()
             if user is None
@@ -2182,31 +2366,33 @@ class StatisticsView(GenericAPIView):
             ).count()
         )
 
-        documents_total = documents.count()
-
-        inbox_tags = tags.filter(is_inbox_tag=True)
+        inbox_tag_pks = list(
+            tags.filter(is_inbox_tag=True).values_list("pk", flat=True),
+        )
 
         documents_inbox = (
-            documents.filter(tags__id__in=inbox_tags).distinct().count()
-            if inbox_tags.exists()
+            documents.filter(tags__id__in=inbox_tag_pks).values("id").distinct().count()
+            if inbox_tag_pks
             else None
         )
 
-        document_file_type_counts = (
+        # Single SQL request for document stats and mime type counts
+        mime_type_stats = list(
             documents.values("mime_type")
-            .annotate(mime_type_count=Count("mime_type"))
-            .order_by("-mime_type_count")
-            if documents_total > 0
-            else []
+            .annotate(
+                mime_type_count=Count("id"),
+                mime_type_chars=Sum("content_length"),
+            )
+            .order_by("-mime_type_count"),
         )
 
-        character_count = (
-            documents.annotate(
-                characters=Length("content"),
-            )
-            .aggregate(Sum("characters"))
-            .get("characters__sum")
-        )
+        # Calculate totals from grouped results
+        documents_total = sum(row["mime_type_count"] for row in mime_type_stats)
+        character_count = sum(row["mime_type_chars"] or 0 for row in mime_type_stats)
+        document_file_type_counts = [
+            {"mime_type": row["mime_type"], "mime_type_count": row["mime_type_count"]}
+            for row in mime_type_stats
+        ]
 
         current_asn = Document.objects.aggregate(
             Max("archive_serial_number", default=0),
@@ -2219,11 +2405,9 @@ class StatisticsView(GenericAPIView):
                 "documents_total": documents_total,
                 "documents_inbox": documents_inbox,
                 "inbox_tag": (
-                    inbox_tags.first().pk if inbox_tags.exists() else None
+                    inbox_tag_pks[0] if inbox_tag_pks else None
                 ),  # backwards compatibility
-                "inbox_tags": (
-                    [tag.pk for tag in inbox_tags] if inbox_tags.exists() else None
-                ),
+                "inbox_tags": (inbox_tag_pks if inbox_tag_pks else None),
                 "document_file_type_counts": document_file_type_counts,
                 "character_count": character_count,
                 "tag_count": len(tags),
@@ -2336,7 +2520,7 @@ class StoragePathViewSet(ModelViewSet, PermissionsAwareDocumentCountMixin):
         document = serializer.validated_data.get("document")
         path = serializer.validated_data.get("path")
 
-        result = validate_filepath_template_and_render(path, document)
+        result = format_filename(document, path)
         return Response(result)
 
 
@@ -2390,6 +2574,10 @@ class UiSettingsView(GenericAPIView):
 
         ui_settings["email_enabled"] = settings.EMAIL_ENABLED
 
+        ai_config = AIConfig()
+
+        ui_settings["ai_enabled"] = ai_config.ai_enabled
+
         user_resp = {
             "id": user.id,
             "username": user.username,
@@ -2426,7 +2614,6 @@ class UiSettingsView(GenericAPIView):
         )
 
 
-@method_decorator(cache_page(60 * 15), name="dispatch")
 @extend_schema_view(
     get=extend_schema(
         description="Get the current version of the Paperless-NGX server",
@@ -2436,31 +2623,34 @@ class UiSettingsView(GenericAPIView):
     ),
 )
 class RemoteVersionView(GenericAPIView):
+    cache_key = "remote_version_view_latest_release"
+
     def get(self, request, format=None):
-        remote_version = "0.0.0"
-        is_greater_than_current = False
         current_version = packaging_version.parse(version.__full_version_str__)
-        try:
-            resp = httpx.get(
-                "https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest",
-                headers={"Accept": "application/json"},
-            )
-            resp.raise_for_status()
+        remote_version = cache.get(self.cache_key)
+        if remote_version is None:
             try:
+                resp = httpx.get(
+                    "https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest",
+                    headers={"Accept": "application/json"},
+                )
+                resp.raise_for_status()
                 data = resp.json()
                 remote_version = data["tag_name"]
                 # Some early tags used ngx-x.y.z
                 remote_version = remote_version.removeprefix("ngx-")
             except ValueError as e:
                 logger.debug(f"An error occurred parsing remote version json: {e}")
-        except httpx.HTTPError as e:
-            logger.debug(f"An error occurred checking for available updates: {e}")
+            except httpx.HTTPError as e:
+                logger.debug(f"An error occurred checking for available updates: {e}")
+
+            if remote_version:
+                cache.set(self.cache_key, remote_version, 60 * 15)
+            else:
+                remote_version = "0.0.0"
 
         is_greater_than_current = (
-            packaging_version.parse(
-                remote_version,
-            )
-            > current_version
+            packaging_version.parse(remote_version) > current_version
         )
 
         return Response(
@@ -2528,6 +2718,10 @@ class TasksViewSet(ReadOnlyModelViewSet):
         PaperlessTask.TaskName.CHECK_SANITY: (
             sanity_check,
             {"scheduled": False, "raise_on_error": False},
+        ),
+        PaperlessTask.TaskName.LLMINDEX_UPDATE: (
+            llmindex_index,
+            {"scheduled": False, "rebuild": False},
         ),
     }
 
@@ -2625,9 +2819,6 @@ def serve_file(*, doc: Document, use_archive: bool, disposition: str):
         # Support browser previewing csv files by using text mime type
         if mime_type in {"application/csv", "text/csv"} and disposition == "inline":
             mime_type = "text/plain"
-
-    if doc.storage_type == Document.STORAGE_TYPE_GPG:
-        file_handle = GnuPG.decrypted(file_handle)
 
     response = HttpResponse(file_handle, content_type=mime_type)
     # Firefox is not able to handle unicode characters in filename field
@@ -3048,6 +3239,31 @@ class SystemStatusView(PassUserMixin):
             last_sanity_check.date_done if last_sanity_check else None
         )
 
+        ai_config = AIConfig()
+        if not ai_config.llm_index_enabled:
+            llmindex_status = "DISABLED"
+            llmindex_error = None
+            llmindex_last_modified = None
+        else:
+            last_llmindex_update = (
+                PaperlessTask.objects.filter(
+                    task_name=PaperlessTask.TaskName.LLMINDEX_UPDATE,
+                )
+                .order_by("-date_done")
+                .first()
+            )
+            llmindex_status = "OK"
+            llmindex_error = None
+            if last_llmindex_update is None:
+                llmindex_status = "WARNING"
+                llmindex_error = "No LLM index update tasks found"
+            elif last_llmindex_update and last_llmindex_update.status == states.FAILURE:
+                llmindex_status = "ERROR"
+                llmindex_error = last_llmindex_update.result
+            llmindex_last_modified = (
+                last_llmindex_update.date_done if last_llmindex_update else None
+            )
+
         return Response(
             {
                 "pngx_version": current_version,
@@ -3085,6 +3301,9 @@ class SystemStatusView(PassUserMixin):
                     "sanity_check_status": sanity_check_status,
                     "sanity_check_last_run": sanity_check_last_run,
                     "sanity_check_error": sanity_check_error,
+                    "llmindex_status": llmindex_status,
+                    "llmindex_last_modified": llmindex_last_modified,
+                    "llmindex_error": llmindex_error,
                 },
             },
         )

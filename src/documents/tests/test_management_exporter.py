@@ -86,9 +86,8 @@ class TestExportImport(
             content="Content",
             checksum="82186aaa94f0b98697d704b90fd1c072",
             title="wow_dec",
-            filename="0000004.pdf.gpg",
+            filename="0000004.pdf",
             mime_type="application/pdf",
-            storage_type=Document.STORAGE_TYPE_GPG,
         )
 
         self.note = Note.objects.create(
@@ -242,10 +241,9 @@ class TestExportImport(
                     checksum = hashlib.md5(f.read()).hexdigest()
                 self.assertEqual(checksum, element["fields"]["checksum"])
 
-                self.assertEqual(
-                    element["fields"]["storage_type"],
-                    Document.STORAGE_TYPE_UNENCRYPTED,
-                )
+                # Generated field "content_length" should not be exported,
+                # it is automatically computed during import.
+                self.assertNotIn("content_length", element["fields"])
 
                 if document_exporter.EXPORTER_ARCHIVE_NAME in element:
                     fname = (
@@ -436,7 +434,7 @@ class TestExportImport(
         Document.objects.create(
             checksum="AAAAAAAAAAAAAAAAA",
             title="wow",
-            filename="0000004.pdf",
+            filename="0000010.pdf",
             mime_type="application/pdf",
         )
         self.assertRaises(FileNotFoundError, call_command, "document_exporter", target)
@@ -571,7 +569,7 @@ class TestExportImport(
         with self.assertRaises(CommandError) as e:
             call_command(*args)
 
-            self.assertEqual("That path isn't a directory", str(e))
+        self.assertEqual("That path doesn't exist", str(e.exception))
 
     def test_export_target_exists_but_is_file(self):
         """
@@ -589,7 +587,7 @@ class TestExportImport(
             with self.assertRaises(CommandError) as e:
                 call_command(*args)
 
-                self.assertEqual("That path isn't a directory", str(e))
+            self.assertEqual("That path isn't a directory", str(e.exception))
 
     def test_export_target_not_writable(self):
         """
@@ -608,7 +606,10 @@ class TestExportImport(
             with self.assertRaises(CommandError) as e:
                 call_command(*args)
 
-                self.assertEqual("That path doesn't appear to be writable", str(e))
+            self.assertEqual(
+                "That path doesn't appear to be writable",
+                str(e.exception),
+            )
 
     def test_no_archive(self):
         """
