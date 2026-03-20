@@ -631,6 +631,100 @@ describe('FilterableDropdownComponent & FilterableDropdownSelectionModel', () =>
     ])
   })
 
+  it('deselecting a parent clears selected descendants', () => {
+    const root: Tag = { id: 100, name: 'Root Tag' }
+    const child: Tag = { id: 101, name: 'Child Tag', parent: root.id }
+    const grandchild: Tag = {
+      id: 102,
+      name: 'Grandchild Tag',
+      parent: child.id,
+    }
+    const other: Tag = { id: 103, name: 'Other Tag' }
+
+    selectionModel.items = [root, child, grandchild, other]
+    selectionModel.set(root.id, ToggleableItemState.Selected, false)
+    selectionModel.set(child.id, ToggleableItemState.Selected, false)
+    selectionModel.set(grandchild.id, ToggleableItemState.Selected, false)
+    selectionModel.set(other.id, ToggleableItemState.Selected, false)
+
+    selectionModel.toggle(root.id, false)
+
+    expect(selectionModel.getSelectedItems()).toEqual([other])
+  })
+
+  it('un-excluding a parent clears excluded descendants', () => {
+    const root: Tag = { id: 110, name: 'Root Tag' }
+    const child: Tag = { id: 111, name: 'Child Tag', parent: root.id }
+    const other: Tag = { id: 112, name: 'Other Tag' }
+
+    selectionModel.items = [root, child, other]
+    selectionModel.set(root.id, ToggleableItemState.Excluded, false)
+    selectionModel.set(child.id, ToggleableItemState.Excluded, false)
+    selectionModel.set(other.id, ToggleableItemState.Excluded, false)
+
+    selectionModel.exclude(root.id, false)
+
+    expect(selectionModel.getExcludedItems()).toEqual([other])
+  })
+
+  it('excluding a selected parent clears selected descendants', () => {
+    const root: Tag = { id: 120, name: 'Root Tag' }
+    const child: Tag = { id: 121, name: 'Child Tag', parent: root.id }
+    const other: Tag = { id: 122, name: 'Other Tag' }
+
+    selectionModel.manyToOne = true
+    selectionModel.items = [root, child, other]
+    selectionModel.set(root.id, ToggleableItemState.Selected, false)
+    selectionModel.set(child.id, ToggleableItemState.Selected, false)
+    selectionModel.set(other.id, ToggleableItemState.Selected, false)
+
+    selectionModel.exclude(root.id, false)
+
+    expect(selectionModel.getExcludedItems()).toEqual([root])
+    expect(selectionModel.getSelectedItems()).toEqual([other])
+  })
+
+  it('resorts items immediately when document count sorting enabled', () => {
+    const apple: Tag = { id: 55, name: 'Apple' }
+    const zebra: Tag = { id: 56, name: 'Zebra' }
+
+    selectionModel.documentCountSortingEnabled = true
+    selectionModel.items = [apple, zebra]
+    expect(selectionModel.items.map((item) => item?.id ?? null)).toEqual([
+      null,
+      apple.id,
+      zebra.id,
+    ])
+
+    selectionModel.documentCounts = [
+      { id: zebra.id, document_count: 5 },
+      { id: apple.id, document_count: 0 },
+    ]
+
+    expect(selectionModel.items.map((item) => item?.id ?? null)).toEqual([
+      null,
+      zebra.id,
+      apple.id,
+    ])
+  })
+
+  it('does not resort items by default when document counts are set', () => {
+    const first: Tag = { id: 57, name: 'First' }
+    const second: Tag = { id: 58, name: 'Second' }
+
+    selectionModel.items = [first, second]
+    selectionModel.documentCounts = [
+      { id: second.id, document_count: 10 },
+      { id: first.id, document_count: 0 },
+    ]
+
+    expect(selectionModel.items.map((item) => item?.id ?? null)).toEqual([
+      null,
+      first.id,
+      second.id,
+    ])
+  })
+
   it('uses fallback document counts when selection data is missing', () => {
     const fallbackRoot: Tag = {
       id: 50,

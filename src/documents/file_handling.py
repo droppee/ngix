@@ -99,45 +99,50 @@ def generate_unique_filename(doc, *, archive_filename=False) -> Path:
             return new_filename
 
 
+def format_filename(document: Document, template_str: str) -> str | None:
+    rendered_filename = validate_filepath_template_and_render(
+        template_str,
+        document,
+    )
+    if rendered_filename is None:
+        return None
+
+    # Apply this setting.  It could become a filter in the future (or users could use |default)
+    if settings.FILENAME_FORMAT_REMOVE_NONE:
+        rendered_filename = rendered_filename.replace("/-none-/", "/")
+        rendered_filename = rendered_filename.replace(" -none-", "")
+        rendered_filename = rendered_filename.replace("-none-", "")
+        rendered_filename = rendered_filename.strip(os.sep)
+
+    rendered_filename = rendered_filename.replace(
+        "-none-",
+        "none",
+    )  # backward compatibility
+
+    return rendered_filename
+
+
 def generate_filename(
     doc: Document,
     *,
     counter=0,
     append_gpg=True,
     archive_filename=False,
+    use_format=True,
 ) -> Path:
     base_path: Path | None = None
 
-    def format_filename(document: Document, template_str: str) -> str | None:
-        rendered_filename = validate_filepath_template_and_render(
-            template_str,
-            document,
-        )
-        if rendered_filename is None:
-            return None
-
-        # Apply this setting.  It could become a filter in the future (or users could use |default)
-        if settings.FILENAME_FORMAT_REMOVE_NONE:
-            rendered_filename = rendered_filename.replace("/-none-/", "/")
-            rendered_filename = rendered_filename.replace(" -none-", "")
-            rendered_filename = rendered_filename.replace("-none-", "")
-            rendered_filename = rendered_filename.strip(os.sep)
-
-        rendered_filename = rendered_filename.replace(
-            "-none-",
-            "none",
-        )  # backward compatibility
-
-        return rendered_filename
-
     # Determine the source of the format string
-    if doc.storage_path is not None:
-        filename_format = doc.storage_path.path
-    elif settings.FILENAME_FORMAT is not None:
-        # Maybe convert old to new style
-        filename_format = convert_format_str_to_template_format(
-            settings.FILENAME_FORMAT,
-        )
+    if use_format:
+        if doc.storage_path is not None:
+            filename_format = doc.storage_path.path
+        elif settings.FILENAME_FORMAT is not None:
+            # Maybe convert old to new style
+            filename_format = convert_format_str_to_template_format(
+                settings.FILENAME_FORMAT,
+            )
+        else:
+            filename_format = None
     else:
         filename_format = None
 

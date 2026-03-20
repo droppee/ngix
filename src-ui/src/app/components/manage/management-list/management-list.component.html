@@ -62,9 +62,9 @@
 
 @if (!loading) {
   <div class="d-flex mb-2">
-    @if (collectionSize > 0) {
+    @if (displayCollectionSize > 0) {
       <div>
-        <ng-container i18n>{collectionSize, plural, =1 {One {{typeName}}} other {{{collectionSize || 0}} total {{typeNamePlural}}}}</ng-container>
+        <ng-container i18n>{displayCollectionSize, plural, =1 {One {{typeName}}} other {{{displayCollectionSize || 0}} total {{typeNamePlural}}}}</ng-container>
         @if (selectedObjects.size > 0) {
           &nbsp;({{selectedObjects.size}} selected)
         }
@@ -94,8 +94,14 @@
     <td scope="row">{{ getDocumentCount(object) }}</td>
     @for (column of extraColumns; track column) {
       <td scope="row" [ngClass]="{ 'd-none d-sm-table-cell' : column.hideOnMobile }">
-        @if (column.rendersHtml) {
-          <div [innerHtml]="column.valueFn.call(null, object) | safeHtml"></div>
+        @if (column.badgeFn) {
+          <span
+            class="badge"
+            [style.color]="column.badgeFn.call(null, object)?.textColor"
+            [style.backgroundColor]="column.badgeFn.call(null, object)?.backgroundColor"
+          >
+            {{ column.badgeFn.call(null, object)?.text }}
+          </span>
         } @else if (column.monospace) {
           <span class="font-monospace">{{ column.valueFn.call(null, object) }}</span>
         } @else {

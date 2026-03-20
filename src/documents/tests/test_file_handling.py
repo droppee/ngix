@@ -16,6 +16,7 @@ from django.utils import timezone
 from documents.file_handling import create_source_path_directory
 from documents.file_handling import delete_empty_directories
 from documents.file_handling import generate_filename
+from documents.file_handling import generate_unique_filename
 from documents.models import Correspondent
 from documents.models import CustomField
 from documents.models import CustomFieldInstance
@@ -530,6 +531,7 @@ class TestFileHandling(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
 
     @override_settings(
         FILENAME_FORMAT="{{title}}_{{custom_fields|get_cf_value('test')}}",
+        CELERY_TASK_ALWAYS_EAGER=True,
     )
     @mock.patch("documents.signals.handlers.update_filename_and_move_files")
     def test_select_cf_updated(self, m):
@@ -579,7 +581,7 @@ class TestFileHandling(DirectoriesMixin, FileSystemAssertsMixin, TestCase):
         }
         cf.save()
         self.assertEqual(generate_filename(doc), Path("document_aubergine.pdf"))
-        # handler should have been called
+        # handler should have been called once via the async task
         self.assertEqual(m.call_count, 1)
 
 
@@ -1079,6 +1081,47 @@ class TestFilenameGeneration(DirectoriesMixin, TestCase):
         )
 
     @override_settings(
+        FILENAME_FORMAT=(
+            "{% if correspondent == 'none' %}none/{% endif %}"
+            "{% if correspondent == '-none-' %}dash/{% endif %}"
+            "{% if not correspondent %}false/{% endif %}"
+            "{% if correspondent != 'none' %}notnoneyes/{% else %}notnoneno/{% endif %}"
+            "{{ correspondent or 'missing' }}/{{ title }}"
+        ),
+    )
+    def test_placeholder_matches_none_variants_and_false(self):
+        """
+        GIVEN:
+            - Templates that compare against 'none', '-none-' and rely on truthiness
+        WHEN:
+            - A document has or lacks a correspondent
+        THEN:
+            - Empty placeholders behave like both strings and evaluate False
+        """
+        doc_without_correspondent = Document.objects.create(
+            title="does not matter",
+            mime_type="application/pdf",
+            checksum="abc",
+        )
+        doc_with_correspondent = Document.objects.create(
+            title="does not matter",
+            mime_type="application/pdf",
+            checksum="def",
+            correspondent=Correspondent.objects.create(name="Acme"),
+        )
+
+        self.assertEqual(
+            generate_filename(doc_without_correspondent),
+            Path(
+                "none/dash/false/notnoneno/missing/does not matter.pdf",
+            ),
+        )
+        self.assertEqual(
+            generate_filename(doc_with_correspondent),
+            Path("notnoneyes/Acme/does not matter.pdf"),
+        )
+
+    @override_settings(
         FILENAME_FORMAT="{created_year_short}/{created_month_name_short}/{created_month_name}/{title}",
     )
     def test_short_names_created(self):
@@ -1298,6 +1341,41 @@ class TestFilenameGeneration(DirectoriesMixin, TestCase):
             Path("somepath/asn-201-400/asn-3xx/Does Matter.pdf"),
         )
 
+    def test_template_related_context_keeps_legacy_string_coercion(self):
+        """
+        GIVEN:
+            - A storage path template that uses related objects directly as strings
+        WHEN:
+            - Filepath for a document with this format is called
+        THEN:
+            - Related objects coerce to their names (legacy behavior)
+            - Explicit attribute access remains available for new templates
+        """
+        sp = StoragePath.objects.create(
+            name="PARTNER",
+            path=(
+                "{{ document.storage_path|lower }} / "
+                "{{ document.correspondent|lower|replace('mi:', 'mieter/') }} / "
+                "{{ document_type|lower }} / "
+                "{{ title|lower }}"
+            ),
+        )
+        doc = Document.objects.create(
+            title="scan_017562",
+            created=datetime.date(2025, 7, 2),
+            added=timezone.make_aware(datetime.datetime(2026, 3, 3, 11, 53, 16)),
+            mime_type="application/pdf",
+            checksum="test-checksum",
+            storage_path=sp,
+            correspondent=Correspondent.objects.create(name="mi:kochkach"),
+            document_type=DocumentType.objects.create(name="Mietvertrag"),
+        )
+
+        self.assertEqual(
+            generate_filename(doc),
+            Path("partner/mieter/kochkach/mietvertrag/scan_017562.pdf"),
+        )
+
     @override_settings(
         FILENAME_FORMAT="{{creation_date}}/{{ title_name_str }}",
     )
@@ -1339,11 +1417,11 @@ class TestFilenameGeneration(DirectoriesMixin, TestCase):
     def test_template_with_security(self):
         """
         GIVEN:
-            - Filename format with one or more undefined variables
+            - Filename format with an unavailable document attribute
         WHEN:
             - Filepath for a document with this format is called
         THEN:
-            - The first undefined variable is logged
+            - The missing attribute is logged
             - The default format is used
         """
         doc_a = Document.objects.create(
@@ -1365,7 +1443,7 @@ class TestFilenameGeneration(DirectoriesMixin, TestCase):
             self.assertEqual(len(capture.output), 1)
             self.assertEqual(
                 capture.output[0],
-                "WARNING:paperless.templating:Template attempted restricted operation: <bound method Model.save of <Document: 2020-06-25 Does Matter>> is not safely callable",
+                "ERROR:paperless.templating:Template variable error: 'dict object' has no attribute 'save'",
             )
 
     def test_template_with_custom_fields(self):
@@ -1588,6 +1666,88 @@ class TestFilenameGeneration(DirectoriesMixin, TestCase):
                 generate_filename(doc),
                 Path("brussels-belgium/some-title-with-special-characters.pdf"),
             )
+
+
+class TestCustomFieldFilenameUpdates(
+    DirectoriesMixin,
+    FileSystemAssertsMixin,
+    TestCase,
+):
+    def setUp(self):
+        self.cf = CustomField.objects.create(
+            name="flavor",
+            data_type=CustomField.FieldDataType.STRING,
+        )
+        self.doc = Document.objects.create(
+            title="document",
+            mime_type="application/pdf",
+            checksum="abc123",
+        )
+        self.cfi = CustomFieldInstance.objects.create(
+            field=self.cf,
+            document=self.doc,
+            value_text="initial",
+        )
+        return super().setUp()
+
+    @override_settings(FILENAME_FORMAT=None)
+    def test_custom_field_not_in_template_skips_filename_work(self):
+        storage_path = StoragePath.objects.create(path="{{created}}/{{ title }}")
+        self.doc.storage_path = storage_path
+        self.doc.save()
+        initial_filename = generate_filename(self.doc)
+        Document.objects.filter(pk=self.doc.pk).update(filename=str(initial_filename))
+        self.doc.refresh_from_db()
+        Path(self.doc.source_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.doc.source_path).touch()
+
+        with mock.patch("documents.signals.handlers.generate_unique_filename") as m:
+            m.side_effect = generate_unique_filename
+            self.cfi.value_text = "updated"
+            self.cfi.save()
+
+        self.doc.refresh_from_db()
+        self.assertEqual(Path(self.doc.filename), initial_filename)
+        self.assertEqual(m.call_count, 0)
+
+    @override_settings(FILENAME_FORMAT=None)
+    def test_custom_field_in_template_triggers_filename_update(self):
+        storage_path = StoragePath.objects.create(
+            path="{{ custom_fields|get_cf_value('flavor') }}/{{ title }}",
+        )
+        self.doc.storage_path = storage_path
+        self.doc.save()
+        initial_filename = generate_filename(self.doc)
+        Document.objects.filter(pk=self.doc.pk).update(filename=str(initial_filename))
+        self.doc.refresh_from_db()
+        Path(self.doc.source_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.doc.source_path).touch()
+
+        with mock.patch("documents.signals.handlers.generate_unique_filename") as m:
+            m.side_effect = generate_unique_filename
+            self.cfi.value_text = "updated"
+            self.cfi.save()
+
+        self.doc.refresh_from_db()
+        expected_filename = Path("updated/document.pdf")
+        self.assertEqual(Path(self.doc.filename), expected_filename)
+        self.assertTrue(Path(self.doc.source_path).is_file())
+        self.assertLessEqual(m.call_count, 1)
+
+    @override_settings(FILENAME_FORMAT=None)
+    def test_overlong_storage_path_keeps_existing_filename(self):
+        initial_filename = generate_filename(self.doc)
+        Document.objects.filter(pk=self.doc.pk).update(filename=str(initial_filename))
+        self.doc.refresh_from_db()
+        Path(self.doc.source_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.doc.source_path).touch()
+
+        self.doc.storage_path = StoragePath.objects.create(path="a" * 1100)
+        self.doc.save()
+
+        self.doc.refresh_from_db()
+        self.assertEqual(Path(self.doc.filename), initial_filename)
+        self.assertTrue(Path(self.doc.source_path).is_file())
 
 
 class TestPathDateLocalization:

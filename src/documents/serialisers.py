@@ -6,6 +6,7 @@ import re
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Literal
 
 import magic
@@ -18,9 +19,12 @@ from django.core.exceptions import ValidationError
 from django.core.validators import DecimalValidator
 from django.core.validators import EmailValidator
 from django.core.validators import MaxLengthValidator
+from django.core.validators import MaxValueValidator
+from django.core.validators import MinValueValidator
 from django.core.validators import RegexValidator
 from django.core.validators import integer_validator
 from django.db.models import Count
+from django.db.models.functions import Lower
 from django.utils.crypto import get_random_string
 from django.utils.dateparse import parse_datetime
 from django.utils.text import slugify
@@ -37,7 +41,9 @@ from guardian.utils import get_group_obj_perms_model
 from guardian.utils import get_user_obj_perms_model
 from rest_framework import fields
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.fields import SerializerMethodField
+from rest_framework.filters import OrderingFilter
 
 if settings.AUDIT_LOG_ENABLED:
     from auditlog.context import set_actor
@@ -68,7 +74,10 @@ from documents.models import WorkflowTrigger
 from documents.parsers import is_mime_type_supported
 from documents.permissions import get_document_count_filter_for_user
 from documents.permissions import get_groups_with_only_permission
+from documents.permissions import get_objects_for_user_owner_aware
+from documents.permissions import has_perms_owner_aware
 from documents.permissions import set_permissions_for_object
+from documents.regex import validate_regex_pattern
 from documents.templating.filepath import validate_filepath_template_and_render
 from documents.templating.utils import convert_format_str_to_template_format
 from documents.validators import uri_validator
@@ -139,10 +148,11 @@ class MatchingModelSerializer(serializers.ModelSerializer):
             and self.initial_data["matching_algorithm"] == MatchingModel.MATCH_REGEX
         ):
             try:
-                re.compile(match)
-            except re.error as e:
+                validate_regex_pattern(match)
+            except ValueError as e:
+                logger.debug(f"Invalid regular expression: {e!s}")
                 raise serializers.ValidationError(
-                    _("Invalid regular expression: %(error)s") % {"error": str(e.msg)},
+                    "Invalid regular expression, see log for details.",
                 )
         return match
 
@@ -430,6 +440,19 @@ class OwnedObjectSerializer(
         return instance
 
     def update(self, instance, validated_data):
+        user = getattr(self, "user", None)
+        is_superuser = user.is_superuser if user is not None else False
+        is_owner = instance.owner == user if user is not None else False
+        is_unowned = instance.owner is None
+
+        if (
+            ("owner" in validated_data and validated_data["owner"] != instance.owner)
+            or "set_permissions" in validated_data
+        ) and not (is_superuser or is_owner or is_unowned):
+            raise PermissionDenied(
+                _("Insufficient permissions."),
+            )
+
         if "set_permissions" in validated_data:
             self._set_permissions(validated_data["set_permissions"], instance)
         self.validate_unique_together(validated_data, instance)
@@ -574,17 +597,38 @@ class TagSerializer(MatchingModelSerializer, OwnedObjectSerializer):
         ),
     )
     def get_children(self, obj):
-        filter_q = self.context.get("document_count_filter")
-        if filter_q is None:
+        children_map = self.context.get("children_map")
+        if children_map is not None:
+            children = children_map.get(obj.pk, [])
+        else:
+            filter_q = self.context.get("document_count_filter")
             request = self.context.get("request")
-            user = getattr(request, "user", None) if request else None
-            filter_q = get_document_count_filter_for_user(user)
-            self.context["document_count_filter"] = filter_q
+            if filter_q is None:
+                user = getattr(request, "user", None) if request else None
+                filter_q = get_document_count_filter_for_user(user)
+                self.context["document_count_filter"] = filter_q
+
+            children = (
+                obj.get_children_queryset()
+                .select_related("owner")
+                .annotate(document_count=Count("documents", filter=filter_q))
+            )
+
+            view = self.context.get("view")
+            ordering = (
+                OrderingFilter().get_ordering(request, children, view)
+                if request and view
+                else None
+            )
+            ordering = ordering or (Lower("name"),)
+            children = children.order_by(*ordering)
+
         serializer = TagSerializer(
-            obj.get_children_queryset()
-            .select_related("owner")
-            .annotate(document_count=Count("documents", filter=filter_q)),
+            children,
             many=True,
+            user=self.user,
+            full_perms=self.full_perms,
+            all_fields=self.all_fields,
             context=self.context,
         )
         return serializer.data
@@ -672,6 +716,9 @@ class StoragePathField(serializers.PrimaryKeyRelatedField):
 
 class CustomFieldSerializer(serializers.ModelSerializer):
     def __init__(self, *args, **kwargs):
+        # Ignore args passed by permissions mixin
+        kwargs.pop("user", None)
+        kwargs.pop("full_perms", None)
         context = kwargs.get("context")
         self.api_version = int(
             context.get("request").version
@@ -854,6 +901,13 @@ class CustomFieldInstanceSerializer(serializers.ModelSerializer):
                 uri_validator(data["value"])
             elif field.data_type == CustomField.FieldDataType.INT:
                 integer_validator(data["value"])
+                try:
+                    value_int = int(data["value"])
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError("Enter a valid integer.")
+                # Keep values within the PostgreSQL integer range
+                MinValueValidator(-2147483648)(value_int)
+                MaxValueValidator(2147483647)(value_int)
             elif (
                 field.data_type == CustomField.FieldDataType.MONETARY
                 and data["value"] != ""
@@ -2126,6 +2180,17 @@ class ShareLinkSerializer(OwnedObjectSerializer):
         validated_data["slug"] = get_random_string(50)
         return super().create(validated_data)
 
+    def validate_document(self, document):
+        if self.user is not None and has_perms_owner_aware(
+            self.user,
+            "view_document",
+            document,
+        ):
+            return document
+        raise PermissionDenied(
+            _("Insufficient permissions."),
+        )
+
 
 class BulkEditObjectsSerializer(SerializerWithPerms, SetPermissionsMixin):
     objects = serializers.ListField(
@@ -2532,7 +2597,8 @@ class WorkflowSerializer(serializers.ModelSerializer):
                 set_triggers.append(trigger_instance)
 
         if actions is not None and actions is not serializers.empty:
-            for action in actions:
+            for index, action in enumerate(actions):
+                action["order"] = index
                 assign_tags = action.pop("assign_tags", None)
                 assign_view_users = action.pop("assign_view_users", None)
                 assign_view_groups = action.pop("assign_view_groups", None)
@@ -2659,6 +2725,16 @@ class WorkflowSerializer(serializers.ModelSerializer):
 
         return instance
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        actions = instance.actions.order_by("order", "pk")
+        data["actions"] = WorkflowActionSerializer(
+            actions,
+            many=True,
+            context=self.context,
+        ).data
+        return data
+
 
 class TrashSerializer(SerializerWithPerms):
     documents = serializers.ListField(
@@ -2691,8 +2767,22 @@ class StoragePathTestSerializer(SerializerWithPerms):
     )
 
     document = serializers.PrimaryKeyRelatedField(
-        queryset=Document.objects.all(),
+        queryset=Document.objects.none(),
         required=True,
         label="Document",
         write_only=True,
     )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if user is not None and user.is_authenticated:
+            document_field = self.fields.get("document")
+            if not isinstance(document_field, serializers.PrimaryKeyRelatedField):
+                return
+            document_field.queryset = get_objects_for_user_owner_aware(
+                user,
+                "documents.view_document",
+                Document,
+            )

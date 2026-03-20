@@ -1,4 +1,8 @@
-# Usage Overview
+---
+title: Basic Usage
+---
+
+# Usage
 
 Paperless-ngx is an application that manages your personal documents. With
 the (optional) help of a document scanner (see [the scanners wiki](https://github.com/paperless-ngx/paperless-ngx/wiki/Scanner-&-Software-Recommendations)), Paperless-ngx transforms your unwieldy
@@ -344,6 +348,11 @@ permissions can be granted to limit access to certain parts of the UI (and corre
 
 Superusers can access all parts of the front and backend application as well as any and all objects. Superuser status can only be granted by another superuser.
 
+!!! tip
+
+    Because superuser accounts can see all objects and documents, you may want to use a regular account for day-to-day use. Additional superuser accounts can
+    be created via [cli](administration.md#create-superuser) or granted superuser status from an existing superuser account.
+
 #### Admin Status
 
 Admin status (Django 'staff status') grants access to viewing the paperless logs and the system status dialog
@@ -443,6 +452,10 @@ flowchart TD
     'Updated'
     trigger(s)"}
 
+    scheduled{"Documents
+    matching
+    trigger(s)"}
+
     A[New Document] --> consumption
     consumption --> |Yes| C[Workflow Actions Run]
     consumption --> |No| D
@@ -455,6 +468,11 @@ flowchart TD
     updated --> |Yes| J[Workflow Actions Run]
     updated --> |No| K
     J --> K[Document Saved]
+    L[Scheduled Task Check<br/>hourly at :05] --> M[Get All Scheduled Triggers]
+    M --> scheduled
+    scheduled --> |Yes| N[Workflow Actions Run]
+    scheduled --> |No| O[Document Saved]
+    N --> O
 ```
 
 #### Filters {#workflow-trigger-filters}
@@ -552,7 +570,8 @@ applied. You can use the following placeholders in the template with any trigger
 -   `{{added_day}}`: added day
 -   `{{added_time}}`: added time in HH:MM format
 -   `{{original_filename}}`: original file name without extension
--   `{{filename}}`: current file name without extension
+-   `{{filename}}`: current file name without extension (for "added" workflows this may not be final yet, you can use `{{original_filename}}`)
+-   `{{doc_title}}`: current document title
 
 The following placeholders are only available for "added" or "updated" triggers
 
